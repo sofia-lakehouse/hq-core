@@ -524,6 +524,10 @@ if ! bash "$(dirname "$0")/handoff-thread-isolation.test.sh"; then
   fail "thread isolation suite failed"
 fi
 
+if ! bash "$(dirname "$0")/handoff-finalize-logical-root.test.sh"; then
+  fail "logical-root alias isolation suite failed"
+fi
+
 if [[ "$failures" -gt 0 ]]; then
   echo "Failed $failures handoff-post regression assertions" >&2
   exit 1

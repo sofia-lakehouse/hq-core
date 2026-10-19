@@ -73,7 +73,9 @@ fi
 
 HQ_ROOT="${HQ_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$HQ_ROOT"
-HQ_ROOT="$(pwd -P)"
+# Preserve the caller's logical root for absolute changeset path comparisons.
+# A symlink checkout (including macOS /var) must share the input path prefix.
+HQ_ROOT="$(pwd)"
 HANDOFF_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HANDOFF_SCRIPT_DIR/lib/session-id.sh"
 HAS_GIT_CHECKOUT="false"
