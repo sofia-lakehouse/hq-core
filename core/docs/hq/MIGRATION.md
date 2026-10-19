@@ -2,6 +2,18 @@
 
 Newest release first.
 
+## Release: v16.0.31-beta.1
+
+- No action needed. `/super-conductor` now records per-channel sweep evidence
+  in its save file (`sweep`, one entry per channel, Slack workspace, and email
+  account) through `core/scripts/super-conductor-sweep-check.mjs`. The
+  heartbeat checks that evidence on every tick and prints
+  `SUPER-CONDUCTOR SWEEP-INCOMPLETE` when the previous wakeup skipped a
+  selected target. A channel is marked unavailable only after every listed
+  fallback path was tried, and it is re-tried hourly. Each wakeup's status
+  line names the channels read and skipped. Re-arm a running heartbeat to
+  pick up the check.
+
 ## Release: v16.0.28-beta.1
 
 - No action needed. `/conduct` now runs each worker as a background subagent

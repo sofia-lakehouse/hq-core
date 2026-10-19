@@ -6,9 +6,13 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import random
 import re
 import sys
 import tempfile
+
+# Fixture base time (2026-10-03 04:00 UTC), derived so no raw epoch literal is in the source.
+_TS0 = dt.datetime(2026, 10, 3, 4, 0, tzinfo=dt.timezone.utc).timestamp()
 
 
 def _ts(day, clock):
@@ -487,13 +491,14 @@ def test_skipped_dms_status_says_skipped_not_empty():
         path = os.path.join(root, 'status.json')
         st = sweep.Status(path, 'acme')
         st.start('Checking your DMs', 0.4)
-        st.finish('dms', None, {'ok': False, 'state': 'failed', 'error': 'inbox down'}, 0.45)
+        st.finish('dms', None, {'ok': False, 'state': 'failed', 'note': "Couldn't read DMs.",
+                                'error': "Couldn't read DMs."}, 0.45)
         st.start('Checking your DMs', 0.5)
         st.finish('dms', None, {'ok': False, 'state': 'skipped',
                                 'skipped_reason': 'inbox has no company tag', 'count': None}, 0.55)
         got = json.load(open(path))
     failed, skipped = got['activity']
-    assert failed['state'] == 'failed' and failed['label'] == 'Checking your DMs' and failed['detail'] == 'inbox down', failed
+    assert failed['state'] == 'failed' and failed['label'] == 'Checking your DMs' and failed['detail'] == "Couldn't read DMs.", failed
     assert skipped['state'] == 'skipped' and skipped['label'] == 'Skipped DMs', skipped
     assert skipped['detail'] == 'inbox has no company tag'
     assert '0 DMs' not in skipped['label'] and 'no message' not in json.dumps(skipped).lower()
@@ -927,10 +932,17 @@ def test_personal_brief_skips_company_sources_and_adds_the_welcome():
     assert sum(v['sessions'] for v in d['days'].values()) == 1 and d['main_health'] == {'hq-desktop-app': {'workflows': 0, 'red': [], 'delta': None}}
     w = d['welcome']
     assert w['first_run'] is True and w['import'] is None
-    assert w['sessions'] == {'total': 3, 'claude': 2, 'codex': 1, 'days_seen': 2}, w['sessions']
+    assert w['sessions'] == {'total': 3, 'local': 3, 'imported': 0, 'claude': 2, 'codex': 1, 'cursor': 0,
+                             'days_seen': 2}, w['sessions']
     assert w['repos'] == [{'name': 'hq-desktop-app', 'sessions': 1}, {'name': 'notes', 'sessions': 1}], w['repos']
     assert w['apps'] == ['Claude Code', 'Codex']
     assert [x['kind'] for x in w['next_steps']] == ['connect_company', 'import']
+    assert w['headline'].startswith('HQ found 3 past sessions') and 'Claude Code' in w['headline'], w['headline']
+    # the other company's folder is counted, never named
+    assert [x['name'] for x in w['top_projects']] == ['hq-desktop-app'], w['top_projects']
+    assert 'globex' not in json.dumps(w), w
+    assert sum(x['primary'] for x in w['actions']) == 1, w['actions']
+    assert 'getting_started' not in w and 'note' not in w
     assert 'meetings' not in [a.get('key') for a in st.get('activity', [])]
 
 
@@ -1111,8 +1123,10 @@ def test_welcome_block_names_only_the_brief_companys_repos():
     finally:
         sweep._load_local_sessions = saved
     assert w['repos'] == [{'name': 'web', 'sessions': 1}]
-    assert w['sessions'] == {'total': 3, 'claude': 1, 'codex': 1, 'days_seen': 2}
+    assert w['sessions'] == {'total': 3, 'local': 3, 'imported': 0, 'claude': 1, 'codex': 1, 'cursor': 0,
+                             'days_seen': 2}
     assert [x['kind'] for x in w['next_steps']] == ['connect_integration', 'sync']
+    assert [x['name'] for x in w['top_projects']] == ['web'] and 'secret' not in json.dumps(w)
     assert all(x['id'] and x['reason'] for x in w['next_steps'])
 
 
@@ -1159,6 +1173,829 @@ def test_shipped_files_carry_no_owner_values():
                 for m in pat.finditer(line):
                     hits.append(f'{os.path.basename(path)}:{i}: {m.group(0)}')
     assert not hits, '\n'.join(hits)
+
+
+# ---------- welcome edition: machine inventory and the person's work ----------
+ls_mod = load('local_sessions_welcome', 'local_sessions.py')
+
+
+def _jl(*records):
+    return ''.join(json.dumps(r, separators=(',', ':')) + '\n' for r in records)
+
+
+def _put(path, text, mtime=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+
+
+def _claude_transcript(cwd, title=None):
+    recs = [{'type': 'user', 'cwd': cwd, 'message': {'content': 'Tidy the release notes'}}]
+    if title:
+        recs.append({'type': 'custom-title', 'customTitle': title})
+    return _jl(*recs)
+
+
+def _codex_rollout(cwd, prompt='Plan the launch checklist'):
+    return _jl({'type': 'session_meta', 'payload': {'cwd': cwd}},
+               {'type': 'response_item', 'payload': {'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}})
+
+
+def _fixture_home(home):
+    """A synthetic Mac: two Claude Code config folders, Codex and Cursor."""
+    base = _TS0
+    web, notes = os.path.join(home, 'code', 'web'), os.path.join(home, 'code', 'notes')
+    os.makedirs(os.path.join(web, '.git'))
+    os.makedirs(notes)
+    for i in range(3):
+        _put(os.path.join(home, '.claude', 'projects', '-code-web', f'c-web-{i}.jsonl'),
+             _claude_transcript(web, f'Ship the web fix {i}'), base + i * 3600)
+    _put(os.path.join(home, 'alt-config', 'projects', '-code-notes', 'c-notes-0.jsonl'),
+         _claude_transcript(notes, 'Write the notes index'), base + 20 * 3600)
+    for i in range(2):
+        _put(os.path.join(home, '.codex', 'sessions', '2026', '10', '01', f'rollout-2026-10-01T10-00-0{i}-x-{i}.jsonl'),
+             _codex_rollout(web), base + (10 + i) * 3600)
+    _put(os.path.join(home, '.codex', 'history.jsonl'), _jl({'a': 1}, {'a': 2}, {'a': 3}))
+    _put(os.path.join(home, 'cursor-ws', 'w1', 'state.vscdb'), '')
+    os.makedirs(os.path.join(home, 'cursor-ws', 'w2'))  # no chat state: not counted
+    return web, notes
+
+
+def _inventory(home, **kw):
+    roots = ls_mod.claude_project_roots(home, {'CLAUDE_CONFIG_DIR': os.path.join(home, 'alt-config')})
+    return ls_mod.inventory(claude_roots=roots, codex_root=os.path.join(home, '.codex'),
+                            cursor_root=os.path.join(home, 'cursor-ws'), **kw)
+
+
+def test_inventory_counts_every_harness_in_a_fixture_home():
+    """The first brief counted only HQ-started sessions. The inventory counts
+    every Claude Code transcript (both config folders), Codex rollout and Cursor
+    workspace."""
+    with tempfile.TemporaryDirectory() as home:
+        web, notes = _fixture_home(home)
+        inv = _inventory(home)
+    assert inv['counts'] == {'claude_code': 4, 'codex': 2, 'cursor': 1}, inv['counts']
+    assert 'history_lines' not in inv and inv['unplaced'] == 0 and inv['notes'] == []
+    assert len(inv['sessions']) == 6 and inv['sessions']['c-notes-0'] == 'claude_code'
+    assert inv['sessions']['x-1'] == 'codex', inv['sessions']
+    assert inv['projects'][web]['sessions'] == 5 and inv['projects'][web]['by_harness'] == {'claude_code': 3, 'codex': 2}
+    assert inv['projects'][notes]['sessions'] == 1
+    assert [r['id'] for r in inv['recent']][0] == 'c-notes-0'
+
+
+def test_claude_project_roots_reads_claude_config_dir():
+    with tempfile.TemporaryDirectory() as home:
+        _fixture_home(home)
+        alt = os.path.join(home, 'alt-config')
+        assert ls_mod.claude_project_roots(home, {}) == [os.path.realpath(os.path.join(home, '.claude', 'projects'))]
+        both = ls_mod.claude_project_roots(home, {'CLAUDE_CONFIG_DIR': alt})
+        assert both[1] == os.path.realpath(os.path.join(alt, 'projects')), both
+        # the same folder twice is listed once
+        assert len(ls_mod.claude_project_roots(home, {'CLAUDE_CONFIG_DIR': os.path.join(home, '.claude')})) == 1
+
+
+def test_inventory_counts_everything_after_the_time_budget():
+    """Past the budget, sessions are still counted; only their project is left
+    out, with a plain note."""
+    ticks = iter(range(0, 10 ** 6))
+    with tempfile.TemporaryDirectory() as home:
+        _fixture_home(home)
+        inv = _inventory(home, budget_s=1, clock=lambda: next(ticks))
+    assert sum(inv['counts'].values()) == 7 and len(inv['sessions']) == 6
+    assert inv['unplaced'] > 0 and inv['notes'] == ['Some older sessions were counted without their project'], inv
+
+
+def test_inventory_runtime_stays_bounded():
+    """Benchmark: 40 projects x 30 transcripts plus 200 Codex rollouts in well
+    under the brief's 3-minute budget (reads are capped per project)."""
+    import time
+    with tempfile.TemporaryDirectory() as home:
+        for p in range(40):
+            cwd = os.path.join(home, 'code', f'p{p}')
+            for i in range(30):
+                _put(os.path.join(home, '.claude', 'projects', f'-code-p{p}', f's-{p}-{i}.jsonl'), _claude_transcript(cwd))
+        for i in range(200):
+            _put(os.path.join(home, '.codex', 'sessions', '2026', '10', '02', f'rollout-2026-10-02T10-00-00-r-{i}.jsonl'),
+                 _codex_rollout(os.path.join(home, 'code', 'p1')))
+        t0 = time.monotonic()
+        inv = ls_mod.inventory(claude_roots=[os.path.join(home, '.claude', 'projects')],
+                               codex_root=os.path.join(home, '.codex'), cursor_root=os.path.join(home, 'none'))
+        recent = ls_mod.recent_titles(inv['recent'], codex_root=os.path.join(home, '.codex'))
+        took = time.monotonic() - t0
+    assert inv['counts']['claude_code'] == 1200 and inv['counts']['codex'] == 200
+    assert len(inv['projects']) == 40 and len(recent) == 5
+    assert took < 5, took
+
+
+def _welcome_inv(hq, home):
+    """An inventory with personal, HQ-root, own-company and other-company folders."""
+    return {'counts': {'claude_code': 9, 'codex': 2, 'cursor': 0}, 'unplaced': 0, 'notes': [],
+            'projects': {
+                os.path.join(home, 'code', 'web'): {'path': '', 'sessions': 6, 'last_ts': _TS0,
+                                                    'by_harness': {'claude_code': 4, 'codex': 2},
+                                                    'ids': ['s0', 's1', 's2', 's3', 'k1', 'k2']},
+                hq: {'path': '', 'sessions': 3, 'last_ts': (_TS0 + 3600), 'by_harness': {'claude_code': 3},
+                     'ids': ['s6', 's7', 's8']},
+                os.path.join(hq, 'companies', 'globex', 'projects', 'x'): {
+                    'path': '', 'sessions': 1, 'last_ts': (_TS0 + 7200), 'by_harness': {'claude_code': 1}, 'ids': ['s5']},
+                os.path.join(home, 'code', 'theirs'): {'path': '', 'sessions': 1, 'last_ts': (_TS0 + 7200),
+                                                       'by_harness': {'claude_code': 1}, 'ids': ['s4']}},
+            'sessions': {f's{i}': 'claude_code' for i in range(9)} | {'k1': 'codex', 'k2': 'codex'},
+            'days': {'2026-10-01', '2026-10-02'}, 'recent': []}
+
+
+def _recent(hq, home):
+    return [{'id': 'r1', 'title': 'Ship the web fix ' + 'x' * 100, 'cwd': os.path.join(home, 'code', 'web'),
+             'at': '2026-10-02T09:00:00Z', 'harness': 'claude_code'},
+            {'id': 'r2', 'title': 'Globex plan', 'cwd': os.path.join(hq, 'companies', 'globex'),
+             'at': '2026-10-03T09:00:00Z', 'harness': 'claude_code'},
+            {'id': 'r3', 'title': 'Morning setup', 'cwd': hq, 'at': '2026-10-02T10:00:00Z', 'harness': 'codex'}]
+
+
+def _welcome(company=None, **kw):
+    saved, saved_home = sweep._load_local_sessions, os.environ.get('HOME')
+    sweep._load_local_sessions = lambda: _FakeLocalSessions([])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq, home = os.path.join(tmp, 'hq'), os.path.join(tmp, 'home')
+            os.environ['HOME'] = home
+            os.makedirs(os.path.join(home, 'code', 'web', '.git'))
+            os.makedirs(os.path.join(home, 'code', 'theirs', '.git'))
+            os.makedirs(os.path.join(hq, 'companies', 'globex'))
+            # HQ-root sessions recorded as personal work (no company).
+            for sid in ('s6', 's7', 's8', 'r3'):
+                _put(os.path.join(hq, 'workspace', 'sessions', sid, 'meta.yaml'), 'company_slug: \n')
+            orgs = {os.path.join(home, 'code', 'theirs'): 'globex-org', os.path.join(home, 'code', 'web'): 'alex'}
+            args = dict(inv=_welcome_inv(hq, home), recent=_recent(hq, home), hq_root=hq,
+                        tree={'companies': 1, 'projects': 2, 'knowledge_files': 7},
+                        owners={'globex': 'globex-org'}, remote_org=orgs.get,
+                        commit_at=lambda path: '2026-10-02T08:00:00+00:00')
+            rows = kw.pop('rows', [])
+            args.update(kw)
+            return sweep.welcome_block(rows, company, True, None, **args), home
+    finally:
+        sweep._load_local_sessions = saved
+        if saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = saved_home
+
+
+def test_welcome_names_the_persons_projects_repos_and_recent_work():
+    w, home = _welcome()
+    assert list(w) == [f for f in sweep.WELCOME_FIELDS if f in w], list(w)
+    assert w['sessions'] == {'total': 11, 'local': 11, 'imported': 0, 'claude': 9, 'codex': 2, 'cursor': 0,
+                             'days_seen': 2}
+    assert w['headline'] == 'HQ found 11 past sessions across 4 projects on this Mac, most of them in Claude Code.'
+    assert w['harness']['primary'] == 'claude-code' and w['harness']['counts'] == {'claude_code': 9, 'codex': 2, 'cursor': 0}
+    assert w['harness']['action'] == {'id': 'open-hq-in-harness', 'kind': 'open_harness', 'harness': 'claude-code',
+                                      'label': 'Open HQ in Claude Code', 'launch_prompt': sweep.OPEN_HQ_PROMPT}
+    # the other company's folder and its GitHub owner's repo are counted, never named
+    assert [(p['name'], p['sessions'], p['harness']) for p in w['top_projects']] == [
+        ('web', 6, 'claude-code'), ('HQ', 3, 'claude-code')], w['top_projects']
+    assert w['top_projects'][0]['path'] == '~/code/web', w['top_projects']
+    # the HQ folder sits outside this fixture's home folder: its name only
+    assert w['top_projects'][1]['path'] == 'hq', w['top_projects']
+    assert all(set(p) == set(sweep.WELCOME_PROJECT_FIELDS) for p in w['top_projects'])
+    assert [r['name'] for r in w['top_repos']] == ['web'] and w['top_repos'][0]['last_commit_at'].startswith('2026-10-02')
+    assert all(set(r) == set(sweep.WELCOME_REPO_FIELDS) for r in w['top_repos'])
+    assert [r['project'] for r in w['recent_work']] == ['HQ', 'web'], w['recent_work']
+    assert [r['harness'] for r in w['recent_work']] == ['codex', 'claude-code'], w['recent_work']
+    assert len(w['recent_work'][1]['title']) == sweep.WELCOME_TITLE_CHARS
+    assert all(set(r) == set(sweep.WELCOME_RECENT_FIELDS) for r in w['recent_work'])
+    blob = json.dumps(w)
+    assert 'globex' not in blob.lower() and 'theirs' not in blob and 'Globex plan' not in blob
+    assert w['tree'] == {'companies': 1, 'projects': 2, 'knowledge_files': 7}
+    assert w['apps'] == ['Claude Code', 'Codex']
+
+
+def test_welcome_harness_ids_are_hyphenated_outside_counts():
+    ids = {'claude-code', 'codex', 'cursor'}
+    w, _ = _welcome()
+    assert set(w['harness']['counts']) == {'claude_code', 'codex', 'cursor'}
+    assert w['harness']['primary'] in ids and w['harness']['action']['harness'] in ids
+    assert w['top_projects'] and all(p['harness'] in ids for p in w['top_projects']), w['top_projects']
+    assert w['recent_work'] and all(r['harness'] in ids for r in w['recent_work']), w['recent_work']
+    assert all(a['harness'] in ids for a in w['actions'] if a['kind'] == 'open_harness'), w['actions']
+    counts_free = dict(w, harness={k: v for k, v in w['harness'].items() if k != 'counts'})
+    assert 'claude_code' not in json.dumps(counts_free), counts_free
+
+
+def test_welcome_actions_have_one_primary_and_known_kinds():
+    w, _ = _welcome()
+    kinds = [a['kind'] for a in w['actions']]
+    assert kinds == ['open_harness', 'connect_ai_apps', 'import_history', 'connect_company', 'open_tree'], kinds
+    assert set(kinds) <= set(sweep.WELCOME_ACTION_KINDS)
+    assert [a['kind'] for a in w['actions'] if a['primary']] == ['import_history']
+    assert all(set(a) - {'harness', 'integration'} == set(sweep.WELCOME_ACTION_FIELDS) for a in w['actions']), w['actions']
+    apps = next(a for a in w['actions'] if a['kind'] == 'connect_ai_apps')
+    assert 'integration' not in apps and 'Cursor' in apps['reason'], apps
+    company, _ = _welcome('globex', inv=None, recent=[], owners={})
+    gh = next(a for a in company['actions'] if a['kind'] == 'connect_integration')
+    assert gh['integration'] == {'slug': 'github', 'name': 'GitHub'} and sum(a['primary'] for a in company['actions']) == 1
+    imported, _ = _welcome(has_companies=True)
+    imported_kinds = [a['kind'] for a in imported['actions']]
+    assert 'connect_company' not in imported_kinds and 'connect_company' not in [s['kind'] for s in imported['next_steps']]
+
+
+def test_welcome_with_zero_sessions_gives_getting_started_copy():
+    empty = {'counts': {'claude_code': 0, 'codex': 0, 'cursor': 0}, 'unplaced': 0, 'notes': [],
+             'projects': {}, 'sessions': {}, 'days': set(), 'recent': []}
+    w, _ = _welcome(inv=empty, recent=[])
+    assert w['sessions']['total'] == 0 and w['headline'] == sweep.WELCOME_FIRST_STEPS
+    assert w['getting_started'] == sweep.GETTING_STARTED_NO_SESSIONS
+    assert w['harness']['primary'] is None and w['harness']['action']['label'] == 'Open HQ in Claude Code'
+    assert [a['kind'] for a in w['actions'] if a['primary']] == ['connect_ai_apps']
+    assert w['top_projects'] == [] and w['recent_work'] == []
+    assert rank.welcome_problems({'welcome': w}) == []
+
+
+def test_welcome_inputs_reads_titles_only_for_the_briefs_company():
+    seen = []
+
+    class Mod(_FakeLocalSessions):
+        meta_fields = staticmethod(ls_mod.meta_fields)
+
+        def inventory(self):
+            return {'recent': self.recent}
+
+        def recent_titles(self, recent, keep=None):
+            assert keep(None, None) is False
+            for r in recent:
+                seen.append((r['id'], keep(r['id'], r['cwd'])))
+            return []
+
+    saved = sweep._load_local_sessions
+    with tempfile.TemporaryDirectory() as tmp:
+        hq, home = os.path.join(tmp, 'hq'), os.path.join(tmp, 'home')
+        _put(os.path.join(hq, 'workspace', 'sessions', 'm-globex', 'meta.yaml'), 'company_slug: globex\n')
+        _put(os.path.join(hq, 'workspace', 'sessions', 'm-mine', 'meta.yaml'), 'company_slug: \n')
+        os.makedirs(os.path.join(home, 'code'))
+        mod = Mod([])
+        mod.recent = [{'id': 'row-acme', 'cwd': hq}, {'id': 'm-globex', 'cwd': hq}, {'id': 'm-mine', 'cwd': hq},
+                      {'id': 'u-acme', 'cwd': os.path.join(hq, 'companies', 'acme', 'x')},
+                      {'id': 'u-hq', 'cwd': hq}, {'id': 'u-out', 'cwd': os.path.join(home, 'code')}]
+        sweep._load_local_sessions = lambda: mod
+        try:
+            sweep.welcome_inputs(hq, [{'id': 'row-acme', 'company': 'acme'}], None)
+            personal = dict(seen)
+            seen.clear()
+            sweep.welcome_inputs(hq, [{'id': 'row-acme', 'company': 'acme'}], 'acme')
+            acme = dict(seen)
+        finally:
+            sweep._load_local_sessions = saved
+    assert personal == {'row-acme': False, 'm-globex': False, 'm-mine': True, 'u-acme': False,
+                        'u-hq': False, 'u-out': True}, personal
+    assert acme == {'row-acme': True, 'm-globex': False, 'm-mine': False, 'u-acme': True,
+                    'u-hq': False, 'u-out': False}, acme
+
+
+def test_failed_sources_write_a_plain_note_and_send_details_to_stderr():
+    import io, contextlib
+    err = io.StringIO()
+    sweep.SOURCES.clear()
+
+    def boom(*a):
+        raise RuntimeError('Traceback: KeyError at /private/secret/path')
+
+    try:
+        with contextlib.redirect_stderr(err):
+            assert sweep.source('dms')(boom)() is None
+            got = sweep.failure('main-branch builds', ValueError('Errno 2 nope'))
+        src = dict(sweep.SOURCES['dms'])
+    finally:
+        sweep.SOURCES.clear()
+    assert src == {'ok': False, 'state': 'failed', 'note': "Couldn't read DMs.", 'error': "Couldn't read DMs."}, src
+    assert got == {'note': "Couldn't read main-branch builds.", 'error': "Couldn't read main-branch builds."}
+    assert 'secret/path' in err.getvalue() and 'Errno 2' in err.getvalue()
+
+
+def test_welcome_failure_is_a_plain_note():
+    saved = sweep.welcome_inputs
+    sweep.welcome_inputs = lambda *a, **k: (_ for _ in ()).throw(OSError('Errno 13 /home/x/.codex denied'))
+    try:
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as root, contextlib.redirect_stderr(io.StringIO()):
+            write_products(root)
+            d, _, _ = _run_personal(root)
+    finally:
+        sweep.welcome_inputs = saved
+    assert d['welcome'] == {'first_run': True, 'note': "Couldn't read welcome history."}, d['welcome']
+    assert rank.welcome_problems(d) == []
+
+
+def test_check_brief_flags_empty_state_lines_and_exception_text_on_a_first_run():
+    w = {'first_run': True, 'sessions': {'total': 4}}
+    brief = {'welcome': w, 'lead': 'Nothing owed', 'sections': [{'label': 'LAST 24H', 'text': 'No sessions'}]}
+    probs = rank.welcome_problems(brief)
+    assert [p['text'] for p in probs] == ['Nothing owed', 'No sessions'], probs
+    assert rank.welcome_problems(dict(brief, welcome=dict(w, first_run=False))) == []
+    assert rank.welcome_problems(dict(brief, welcome=dict(w, sessions={'total': 0}))) == []
+    bad = rank.welcome_problems({'welcome': {'first_run': False, 'note': 'Traceback (most recent call last)'}})
+    assert len(bad) == 1 and bad[0]['problem'].startswith('exception text'), bad
+    errno = rank.welcome_problems({'welcome': {'first_run': False, 'note': "[Errno 13] Permission denied: '/x'"}})
+    assert len(errno) == 1, errno
+    # the person's own session titles and folder names are data, not empty-state copy
+    own = dict(w, headline='HQ found 4 past sessions on this Mac.',
+               recent_work=[{'title': 'Error: nothing yet in the Exception handler', 'project': 'No sessions'}],
+               top_projects=[{'name': 'nothing-owed', 'path': '~/code/nothing-owed'}])
+    assert rank.welcome_problems({'welcome': own, 'items': {'shipped': [{'title': 'No sessions bug'}]}}) == []
+    assert 'welcome_problems' in rank.check_brief(_brief())
+    assert 'welcome_problems' in rank.check_brief({'mode': 'person', 'welcome': w, 'lead': 'Nothing needs a call'})
+
+
+def test_welcome_never_names_a_folder_with_an_out_of_window_other_company_session():
+    # No GitHub owners on record, and the other company's session is not in the scan rows.
+    saved = sweep._load_local_sessions
+    sweep._load_local_sessions = lambda: _FakeLocalSessions([])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq, home = os.path.join(tmp, 'hq'), os.path.join(tmp, 'home')
+            shared = os.path.join(hq, 'repos', 'private', 'shared-app')
+            worktree = os.path.join(hq, 'workspace', 'worktrees', 'side-work')
+            mine = os.path.join(home, 'code', 'mine')
+            for d in (shared, worktree, mine):
+                os.makedirs(os.path.join(d, '.git'))
+            _put(os.path.join(hq, 'workspace', 'sessions', 'a1', 'meta.yaml'), 'company_slug: globex\n')
+            _put(os.path.join(hq, 'workspace', 'sessions', 'a2', 'meta.yaml'), 'company_slug: \n')
+            _put(os.path.join(hq, 'workspace', 'sessions', 'a2b', 'meta.yaml'), 'company_slug: \n')
+
+            def proj(n, ids):
+                return {'path': '', 'sessions': n, 'last_ts': _TS0, 'by_harness': {'claude_code': n}, 'ids': ids}
+
+            inv = {'counts': {'claude_code': 6, 'codex': 0, 'cursor': 0}, 'unplaced': 0, 'notes': [],
+                   'projects': {shared: proj(3, ['a2', 'a2b', 'a1']), worktree: proj(2, ['u1', 'u2']),
+                                mine: proj(1, ['m1'])},
+                   'sessions': {k: 'claude_code' for k in ('a1', 'a2', 'a2b', 'u1', 'u2', 'm1')},
+                   'days': {'2026-10-01'}, 'recent': []}
+            recent = [{'id': 'a1', 'title': 'Globex launch plan', 'cwd': shared, 'at': '2026-10-03T00:00:00Z',
+                       'harness': 'claude_code'},
+                      {'id': 'u1', 'title': 'Worktree chore', 'cwd': worktree, 'at': '2026-10-02T00:00:00Z',
+                       'harness': 'claude_code'},
+                      {'id': 'm1', 'title': 'My own fix', 'cwd': mine, 'at': '2026-10-01T00:00:00Z',
+                       'harness': 'claude_code'}]
+            rows = [{'id': 'a2', 'company': None, 'cwd': shared, 'tool': 'claude', 'started_at': '2026-10-01T00:00:00Z'}]
+            w = sweep.welcome_block(rows, None, True, None, inv=inv, recent=recent, hq_root=hq, owners={},
+                                    commit_at=lambda path: None, remote_org=lambda path: None)
+    finally:
+        sweep._load_local_sessions = saved
+    assert [p['name'] for p in w['top_projects']] == ['mine'], w['top_projects']
+    assert [r['name'] for r in w['top_repos']] == ['mine'], w['top_repos']
+    assert [r['title'] for r in w['recent_work']] == ['My own fix'], w['recent_work']
+    blob = json.dumps(w)
+    assert 'shared-app' not in blob and 'side-work' not in blob and 'Globex' not in blob, blob
+    assert w['sessions']['local'] == 6
+
+
+def test_company_brief_names_its_own_folders_and_recent_work():
+    w, _ = _welcome('globex', owners={})
+    assert [p['name'] for p in w['top_projects']] == ['x'], w['top_projects']
+    assert [r['title'] for r in w['recent_work']] == ['Globex plan'], w['recent_work']
+    blob = json.dumps(w)
+    assert '/code/web' not in blob and 'Morning setup' not in blob and 'theirs' not in blob, blob
+
+
+def test_welcome_git_reads_stop_at_the_budget():
+    ticks = iter([0.0] + [sweep.WELCOME_GIT_BUDGET_S + 1] * 1000)
+    calls = []
+    w, _ = _welcome(clock=lambda: next(ticks), commit_at=lambda path: calls.append(path) or 'x',
+                    remote_org=lambda path: calls.append(path) or 'alex')
+    # past the budget no git read runs, and a repo whose owner is unknown is not named
+    assert calls == [] and [p['name'] for p in w['top_projects']] == ['HQ'], (calls, w['top_projects'])
+    assert w['top_repos'] == []
+
+
+def test_welcome_inputs_guards_each_read_with_a_plain_note():
+    import io, contextlib
+
+    class Mod(_FakeLocalSessions):
+        def inventory(self):
+            raise PermissionError("[Errno 13] Permission denied: '/home/x/.codex'")
+
+    saved = sweep._load_local_sessions
+    sweep._load_local_sessions = lambda: Mod([])
+    err = io.StringIO()
+    try:
+        with tempfile.TemporaryDirectory() as hq, contextlib.redirect_stderr(err):
+            got = sweep.welcome_inputs(hq, [], None)
+            w = sweep.welcome_block([], None, True, None, hq_root=hq, **got)
+    finally:
+        sweep._load_local_sessions = saved
+    assert got['inv'] is None and got['recent'] == [] and got['notes'] == ["Couldn't count every past session"], got
+    assert got['tree'] == {'companies': 0, 'projects': 0, 'knowledge_files': 0}, got
+    assert w['note'] == "Couldn't count every past session." and 'Errno' not in json.dumps(w)
+    assert 'Errno 13' in err.getvalue()
+    assert rank.welcome_problems({'welcome': w}) == []
+
+
+def test_session_company_resolver_puts_a_companies_folder_ahead_of_a_personal_record():
+    with tempfile.TemporaryDirectory() as hq:
+        _put(os.path.join(hq, 'workspace', 'sessions', 'g1', 'meta.yaml'), 'company_slug: \n')
+        launch = os.path.join(hq, 'companies', 'globex', 'projects', 'launch')
+        company_for = sweep.session_company_resolver(hq, [{'id': 'g2', 'company': None, 'cwd': launch},
+                                                          {'id': 'a1', 'company': 'acme', 'cwd': launch}])
+        assert company_for('g1', launch) == 'globex'
+        assert company_for('g2', launch) == 'globex'
+        assert company_for('a1', launch) == 'acme'
+        # recorded as personal and outside companies/: personal
+        assert company_for('g1', hq) is None and company_for('g1', '/elsewhere/code') is None
+        # no record inside HQ: unresolved; no record outside HQ: personal
+        assert company_for('zz', os.path.join(hq, 'repos', 'private', 'x')) is sweep.UNRESOLVED
+        assert company_for('zz', '/elsewhere/code') is None
+        assert company_for('zz', None) is sweep.UNRESOLVED
+
+
+def test_welcome_never_names_a_companies_folder_recorded_as_personal():
+    """A session run under companies/globex without a company lock has an empty
+    company_slug. Its folder, title and repo are counted and never named on a
+    personal or person brief."""
+    saved = sweep._load_local_sessions
+    sweep._load_local_sessions = lambda: _FakeLocalSessions([])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            hq = os.path.join(tmp, 'hq')
+            launch = os.path.join(hq, 'companies', 'globex', 'projects', 'launch')
+            plan = os.path.join(hq, 'companies', 'globex', 'projects', 'plan')
+            mine = os.path.join(tmp, 'home', 'code', 'mine')
+            for d in (launch, plan, mine):
+                os.makedirs(d)
+            _put(os.path.join(hq, 'workspace', 'sessions', 'g1', 'meta.yaml'), 'company_slug: \n')
+
+            def proj(n, ids):
+                return {'path': '', 'sessions': n, 'last_ts': _TS0, 'by_harness': {'claude_code': n}, 'ids': ids}
+
+            inv = {'counts': {'claude_code': 3, 'codex': 0, 'cursor': 0}, 'unplaced': 0, 'notes': [],
+                   'projects': {launch: proj(1, ['g1']), plan: proj(1, ['g2']), mine: proj(1, ['m1'])},
+                   'sessions': {'g1': 'claude_code', 'g2': 'claude_code', 'm1': 'claude_code'},
+                   'days': {'2026-10-01'}, 'recent': []}
+            recent = [{'id': 'g1', 'title': 'Globex secret launch', 'cwd': launch, 'at': '2026-10-03T00:00:00Z',
+                       'harness': 'claude_code'},
+                      {'id': 'm1', 'title': 'My own fix', 'cwd': mine, 'at': '2026-10-01T00:00:00Z',
+                       'harness': 'claude_code'}]
+            rows = [{'id': 'g2', 'company': None, 'cwd': plan, 'project': 'plan', 'tool': 'claude',
+                     'started_at': '2026-10-01T00:00:00Z'}]
+            briefs = [sweep.welcome_block(rows, None, True, None, inv=inv, recent=recent, hq_root=hq, owners={},
+                                          also=also, commit_at=lambda path: None, remote_org=lambda path: None)
+                      for also in ((), ('acme',))]
+    finally:
+        sweep._load_local_sessions = saved
+    for w in briefs:
+        assert [p['name'] for p in w['top_projects']] == ['mine'], w['top_projects']
+        assert [r['title'] for r in w['recent_work']] == ['My own fix'], w['recent_work']
+        blob = json.dumps(w)
+        assert '"launch"' not in blob and 'projects/launch' not in blob, blob
+        assert 'Globex' not in blob and 'globex' not in blob, blob
+        assert '"plan"' not in blob, w.get('repos')
+        assert w['sessions']['local'] == 3
+
+
+def test_welcome_counts_cursor_workspaces_as_sessions():
+    w, _ = _welcome()
+    base = w['sessions']['local']
+    cursor = {'counts': {'claude_code': 2, 'codex': 0, 'cursor': 10}, 'unplaced': 0, 'notes': [], 'projects': {},
+              'sessions': {'c1': 'claude_code', 'c2': 'claude_code'}, 'days': set(), 'recent': []}
+    only = dict(cursor, counts={'claude_code': 0, 'codex': 0, 'cursor': 4}, sessions={})
+    with tempfile.TemporaryDirectory() as hq:
+        a = sweep.welcome_block([], None, True, None, inv=cursor, recent=[], hq_root=hq, owners={})
+        b = sweep.welcome_block([], None, True, None, inv=only, recent=[], hq_root=hq, owners={})
+    assert base == 11
+    assert a['sessions']['local'] == 12 and a['sessions']['cursor'] == 10 and a['harness']['primary'] == 'cursor'
+    assert a['headline'] == 'HQ found 12 past sessions on this Mac, most of them in Cursor.', a['headline']
+    # a Cursor-only Mac gets the person's work, not the first-steps copy
+    assert b['sessions']['total'] == 4 and b['headline'] != sweep.WELCOME_FIRST_STEPS and 'getting_started' not in b
+    assert [x['kind'] for x in b['actions'] if x['primary']] != ['connect_ai_apps'], b['actions']
+
+
+def test_recent_titles_reads_a_capped_head_and_stops_at_the_budget():
+    pad = _jl(*[{'type': 'assistant', 'message': {'content': 'x' * 1000}} for _ in range(1500)])
+    with tempfile.TemporaryDirectory() as home:
+        web, _ = _fixture_home(home)
+        # a long transcript whose title sits past the 1 MB head and outside the tail
+        long_path = os.path.join(home, '.claude', 'projects', '-code-web', 'c-long.jsonl')
+        _put(long_path, _claude_transcript(web) + pad + _jl({'type': 'custom-title', 'customTitle': 'Deep title'})
+             + pad, _TS0 + 30 * 3600)
+        assert ls_mod.summarize_transcript(long_path)['title'] == 'Deep title'
+        inv = _inventory(home)
+        codex = os.path.join(home, '.codex')
+        got = ls_mod.recent_titles(inv['recent'], codex_root=codex)
+        assert got[0]['id'] == 'c-long' and got[0]['title'] == 'Tidy the release notes', got[0]
+        ticks = iter([0.0, 0.0] + [ls_mod.RECENT_TITLES_BUDGET_S + 1] * 100)
+        cut = ls_mod.recent_titles(inv['recent'], codex_root=codex, clock=lambda: next(ticks))
+    assert [r['id'] for r in cut] == ['c-long'], cut
+
+# Credential-shaped strings are built from pieces and seeded random values so
+# secret scanners do not flag this file. None of them is a real credential.
+_FAKE_RNG = random.Random(1432)
+
+
+def _fake(alphabet, n):
+    """n seeded random characters; mixes letters and digits when the alphabet has both."""
+    mixed = any(c.isdigit() for c in alphabet) and any(c.isalpha() for c in alphabet)
+    while True:
+        out = ''.join(_FAKE_RNG.choice(alphabet) for _ in range(n))
+        if not mixed or (any(c.isdigit() for c in out) and any(c.isalpha() for c in out)):
+            return out
+
+
+_AZ09 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+_HEXD = '0123456789abcdef'
+_FAKE = {
+    'anthropic export': 'export ANTHROPIC_API_KEY=' + 'sk-' + 'ant-' + 'api03-' + _fake(_AZ09, 16),
+    'openai key': 'try this key ' + 'sk-' + 'proj' + _fake(_AZ09, 16),
+    'github token': 'use token ' + 'gh' + 'p_' + _fake(_AZ09, 20),
+    'github oauth': 'auth with ' + 'gh' + 'o_' + _fake(_AZ09, 20),
+    'github pat': 'the pat is ' + 'github' + '_pat_' + _fake(_AZ09, 20),
+    'slack token': 'post with ' + 'xo' + 'xb-' + _fake('0123456789', 4) + '-' + _fake(_AZ09, 8),
+    'aws key': 'creds ' + 'AK' + 'IA' + _fake('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 16) + ' in us-east-1',
+    'password assign': 'log in with ' + 'password' + '=' + _fake(_AZ09, 8),
+    'pass assign': 'DB_' + 'PASS' + '=' + _fake(_AZ09, 10) + ' and run migrate',
+    'auth assign': 'set MY_' + 'AUTH' + '=' + _fake(_AZ09, 7),
+    'secret colon': 'client_' + 'secret' + ': ' + _fake(_AZ09, 11),
+    'token colon': 'API ' + 'token' + ': ' + _fake(_AZ09, 9),
+    'bearer header': 'curl -H "Authorization: ' + 'Bearer ' + _fake(_AZ09, 18) + '"',
+    'private key': '-----BEGIN ' + 'OPENSSH ' + 'PRIVATE KEY-----',
+    'url credentials': 'clone https://alex:' + _fake(_AZ09, 8) + '@git.example.com/web.git',
+    'high entropy': 'try ' + _fake(_AZ09, 32),
+}
+_CLEAN = ['Tidy the release notes', 'Fix the signup page', 'Review PR 1432', 'Rename the welcome headline',
+          'Update feat/welcome-brief-knows-person notes', 'Add a monkey patch for the passing tests',
+          'Plan the Q4 launch for Acme', 'Why does the build fail on CI?', 'Write the onboarding email']
+# Safe by default: these are ordinary titles, but they name a credential word or
+# hold a long random-looking run, so they are withheld too.
+_WITHHELD = ['auth: fix the login redirect', 'Fix the token refresh bug in the passkey flow',
+             'Review commit ' + _fake(_HEXD, 40),
+             'Rename getUserAuthTokenFromHeaderValue', 'Trace request ' + '-'.join(_fake(_HEXD, n) for n in (8, 4, 4, 4, 12)),
+             'Set up the API key screen']
+
+
+def test_looks_secret_rejects_each_credential_pattern_and_keeps_clean_prompts():
+    # a long scheme made only of punctuation must not hide a URL password
+    for scheme in ('a' + '+' * 40, 'a' + '.' * 40, 'x' + '-' * 31, 'https'):
+        assert ls_mod.looks_secret('clone ' + scheme + '://bob:' + _fake(_AZ09, 8) + '@db.example'), scheme
+    for label, text in _FAKE.items():
+        assert ls_mod.looks_secret(text), label
+        assert ls_mod.cap_line(text) == '', label
+    for text in _CLEAN:
+        assert not ls_mod.looks_secret(text), text
+        assert ls_mod.cap_line(text) == text, text
+    for text in _WITHHELD:
+        assert ls_mod.looks_secret(text), text
+    assert not ls_mod.looks_secret(None) and not ls_mod.looks_secret('')
+
+
+_ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+_B64 = _ALNUM + '+/'
+
+
+def _gen_secret_forms(rng):
+    """(form, text) pairs for the forms the r2 review measured as leaking.
+    Values are generated, so no real credential is in the file."""
+    def pick(alphabet, n):
+        return ''.join(rng.choice(alphabet) for _ in range(n))
+    letters = 'abcdefghijklmnopqrstuvwxyz'
+    hexd = '0123456789abcdef'
+    pw = 'pass' + 'word'
+    for _ in range(200):
+        value = pick(_ALNUM + '!@#$%', rng.randint(4, 16))
+        yield 'prose password', 'my ' + pw + ' is ' + value
+        yield 'bare password', pw + ' ' + value
+        yield 'prose password caps', 'The ' + pw.upper() + ' for staging is ' + value
+        phrase = ' '.join(pick(letters, rng.randint(3, 8)) for _ in range(rng.randint(1, 4)))
+        yield 'password colon passphrase', pw + ': ' + phrase
+        for n in (32, 40, 64):
+            h = pick(hexd, n)
+            if rng.random() < 0.5:
+                h = h.upper()
+            yield f'hex {n}', 'use ' + h
+            yield f'hex {n} api key', 'api ' + 'key ' + h
+            yield f'hex {n} token', 'to' + 'ken ' + h
+        aws = list(pick(_B64, 40))
+        for i in rng.sample(range(1, 39), 3):
+            aws[i] = '/'
+        yield 'aws secret after space', 'aws ' + 'secret ' + ''.join(aws)
+        yield 'aws secret bare', 'use ' + ''.join(aws) + ' for the deploy'
+        yield 'short bearer', 'Authorization: ' + 'Bea' + 'rer ' + pick(_ALNUM, rng.randint(1, 7))
+        yield 'short bearer lower', 'bea' + 'rer ' + pick(_ALNUM, rng.randint(1, 7))
+        yield 'glpat low variety', 'clone with ' + 'gl' + 'pat-' + rng.choice('ab') * rng.randint(8, 20)
+        yield 'base62 run', 'paste ' + pick(_ALNUM, rng.randint(20, 48))
+        yield 'base64 run', 'paste ' + pick(_B64, rng.randint(20, 48)) + '=='
+        yield 'secret word', 'the client ' + 'sec' + 'ret is ' + pick(letters, 10)
+        yield 'credential word', 'here are my ' + 'cred' + 'entials ' + pick(letters, 8)
+
+
+def test_looks_secret_catches_every_generated_form_from_the_r2_review():
+    import random
+    rng = random.Random(1432)
+    misses = {}
+    total = 0
+    for form, text in _gen_secret_forms(rng):
+        total += 1
+        if not ls_mod.looks_secret(text) or ls_mod.cap_line(text) != '':
+            misses.setdefault(form, 0)
+            misses[form] += 1
+    assert total > 3000 and not misses, misses
+
+
+def test_registry_lane_and_thread_titles_use_the_secret_filter():
+    pw = 'pass' + 'word'
+    for bad in ('my ' + pw + ' is ' + _fake(_AZ09, 8), 'use ' + 'ab12' * 8):
+        assert ls_mod.safe_title(bad) is None, bad
+    for good in _CLEAN:
+        assert ls_mod.safe_title(good) == good, good
+    with tempfile.TemporaryDirectory() as hq:
+        empty = os.path.join(hq, 'none')
+        sess = os.path.join(hq, 'workspace', 'sessions')
+        for sid, field, text in (('s-title', 'title', 'my ' + pw + ' is ' + _fake(_AZ09, 8)),
+                                 ('s-task', 'task', 'use ' + 'ab12' * 8),
+                                 ('s-ok', 'title', 'Fix the signup page'),
+                                 ('s-thread', 'title', 'Review PR 1432')):
+            os.makedirs(os.path.join(sess, sid))
+            with open(os.path.join(sess, sid, 'meta.yaml'), 'w', encoding='utf-8') as f:
+                f.write(f'session_id: {sid}\nstarted_at: 2026-10-01T10:00:00Z\n{field}: "{text}"\n')
+        tdir = os.path.join(hq, 'workspace', 'threads')
+        os.makedirs(tdir)
+        with open(os.path.join(tdir, 'T-20261001-110000-x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'session_id': 's-thread', 'type': 'handoff', 'updated_at': '2026-10-01T11:00:00Z',
+                       'metadata': {'title': 'Bea' + 'rer ' + _fake(_AZ09, 4)}}, f)
+        rows = {r['id']: r for r in ls_mod.scan(hq, '2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z',
+                                                claude_root=empty, codex_root=empty)}
+    assert rows['s-ok']['title'] == 'Fix the signup page', rows
+    assert rows['s-title']['title'] is None and rows['s-task']['title'] is None, rows
+    # the thread title looks secret, so the registry title stays
+    assert rows['s-thread']['title'] == 'Review PR 1432', rows
+    base = {'id': 'a', 'started_at': '2026-10-01T10:00:00Z', 'company': 'acme', 'kind': 'you',
+            'project': 'hq-desktop-app', 'cwd': '/x/repos/private/hq-desktop-app'}
+    assert sweep.session_row(dict(base, title='my ' + pw + ' is ' + _fake(_AZ09, 8)), 'acme')['title'] is None
+    assert sweep.session_row(dict(base, title='use ' + 'ab12' * 8), 'acme')['title'] is None
+    assert sweep.session_row(dict(base, title='Fix the signup page'), 'acme')['title'] == 'Fix the signup page'
+
+
+def test_looks_secret_folds_wide_forms_and_short_codes():
+    wide = ''.join(chr(ord(c) + 0xFEE0) for c in 'pass' + 'word')
+    for text in ('my ' + wide + ' is x', 'the ' + 'pi' + 'n is 4821', 'o' + 'tp 993104',
+                 '2' + 'fa code 551203', 'ssh' + 'pass -p x host'):
+        assert ls_mod.looks_secret(text), text
+    for name in ('DB' + 'PASS', 'db' + 'pass', 'SMTP' + 'PASS', 'PG' + 'PASS', 'MY' + 'KEY', 'X' + 'PWD'):
+        for sep in ('=', ': ', ' = '):
+            for value in (_fake(_AZ09, 8), 'abc', 'x'):
+                for text in (name + sep + value, 'export ' + name + sep + value + ' and rerun'):
+                    assert ls_mod.looks_secret(text) and ls_mod.cap_line(text) == '', text
+    for text in ('p' + 'w: correcthorse', 'p' + 'w=' + _fake(_AZ09, 8), 'cr' + 'ed: hunter', 'pass' + 'wort ist x',
+                 'contrase' + 'ña es x', 'mot de ' + 'passe x', 'p' + 'ássword is x',
+                 'use ' + _fake('abcdefghijklmnopqrstuvwxyz0123456789', 16),
+                 'seed ' + _fake('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567', 16)):
+        assert ls_mod.looks_secret(text), text
+    for text in ('Fix the spinner', 'Update the topic list'):
+        assert not ls_mod.looks_secret(text), text
+    # safe by default: the whole word pin is withheld even when it is harmless
+    assert ls_mod.looks_secret('Pin the header')
+    import time
+    start = time.monotonic()
+    ls_mod.looks_secret('a' * 200000)
+    ls_mod.looks_secret('a:' * 100000)
+    ls_mod.looks_secret('a-' * 100000 + '=')
+    ls_mod.looks_secret('a1' * 100000)
+    # long name-like runs with no = or : must stay linear too
+    for text in ('-' * 100000, 'ab-' * 40000, 'abc.' * 30000, 'x_y' * 40000, 'ey' + 'J_' * 50000,
+                 'ey' + 'J-' * 50000, ('ey' + 'J_') * 50000, '\ufdfa' * 20000):
+        ls_mod.looks_secret(text)
+    assert time.monotonic() - start < 2.0
+    # folding an accented or full-width letter onto a key prefix must not hide it
+    tail = 'abcdefghij'
+    for lead in ('\u00e9', 'caf\u00e9', '\uff21', 'x \u00e9'):
+        for prefix in ('sk' + '-', 'gh' + 'p_', 'xo' + 'xb-'):
+            assert ls_mod.looks_secret(lead + prefix + tail), (lead, prefix)
+        jwt = 'ey' + 'J' + tail + '.' + tail + '.' + tail
+        assert ls_mod.looks_secret(lead + jwt), lead
+    # lookalike letters that NFKC leaves alone (dotless i, long s) must not hide a credential word
+    for text in ('key\u0131=x', 'pass\u0131: x', 'export key\u0131=x', '\u017f' + 'ecret is x',
+                 'pa\u017f\u017f' + 'word is x'):
+        assert ls_mod.looks_secret(text), text
+
+
+def test_a_prompt_with_a_secret_is_never_a_title():
+    """The first-prompt fallback drops a line that looks like a credential and
+    does not fall through to a later prompt. The session is still listed, with
+    no title, so the welcome can name it by its project."""
+    with tempfile.TemporaryDirectory() as home:
+        web = os.path.join(home, 'code', 'web')
+        os.makedirs(web)
+        base = _TS0
+        for i, (label, text) in enumerate(_FAKE.items()):
+            _put(os.path.join(home, '.claude', 'projects', '-code-web', f'c-{i}.jsonl'),
+                 _jl({'type': 'user', 'cwd': web, 'message': {'content': text}},
+                     {'type': 'user', 'cwd': web, 'message': {'content': 'Second prompt'}}), base + i)
+            s = ls_mod.summarize_transcript(os.path.join(home, '.claude', 'projects', '-code-web', f'c-{i}.jsonl'))
+            assert s['first_prompt'] == '' and s['title'] is None, label
+        _put(os.path.join(home, '.codex', 'sessions', '2026', '10', '01', 'rollout-2026-10-01T10-00-00-x-0.jsonl'),
+             _codex_rollout(web, prompt=_FAKE['github token']), base + 100)
+        _put(os.path.join(home, '.claude', 'projects', '-code-web', 'c-clean.jsonl'),
+             _claude_transcript(web), base + 200)
+        inv = ls_mod.inventory(claude_roots=[os.path.join(home, '.claude', 'projects')],
+                               codex_root=os.path.join(home, '.codex'), cursor_root=os.path.join(home, 'none'),
+                               home=home)
+        got = ls_mod.recent_titles(inv['recent'], codex_root=os.path.join(home, '.codex'), limit=50)
+    assert got[0]['id'] == 'c-clean' and got[0]['title'] == 'Tidy the release notes', got[0]
+    # every listed session is kept (the scan reads the newest INVENTORY_RECENT), the withheld ones untitled
+    assert len(got) == min(len(_FAKE) + 2, ls_mod.INVENTORY_RECENT) and got[1]['id'] == 'x-0', got
+    assert all(r['title'] is None for r in got[1:]), got
+    blob = json.dumps(got)
+    for text in _FAKE.values():
+        assert text not in blob and text[:40] not in blob
+    # session rows (the regular brief) drop the prompt the same way
+    row = {'title': None, 'project': None, 'kind': None, 'last_activity': None, 'cwd': None}
+    ls_mod.enrich_from_transcript(row, {'title': None, 'first_prompt': '', 'cwd': web})
+    assert row['title'] is None and row['cwd'] == web, row
+    row = {'title': None, 'project': None, 'kind': None, 'last_activity': None, 'cwd': None}
+    ls_mod.enrich_from_transcript(row, {'title': _FAKE['slack token'], 'first_prompt': None, 'cwd': None})
+    assert row['title'] is None, row
+
+
+def test_titles_prefer_custom_titles_summaries_and_codex_thread_names():
+    with tempfile.TemporaryDirectory() as home:
+        web = os.path.join(home, 'code', 'web')
+        os.makedirs(web)
+        base = _TS0
+        proj = os.path.join(home, '.claude', 'projects', '-code-web')
+        _put(os.path.join(proj, 'c-sum.jsonl'),
+             _jl({'type': 'summary', 'summary': 'Release notes cleanup', 'leafUuid': 'u1'},
+                 {'type': 'user', 'cwd': web, 'message': {'content': 'Tidy the release notes'}}), base)
+        _put(os.path.join(proj, 'c-both.jsonl'),
+             _jl({'type': 'summary', 'summary': 'Auto summary'},
+                 {'type': 'user', 'cwd': web, 'message': {'content': 'Tidy the release notes'}},
+                 {'type': 'custom-title', 'customTitle': 'My own name'}), base + 1)
+        codex = os.path.join(home, '.codex')
+        _put(os.path.join(codex, 'sessions', '2026', '10', '01', 'rollout-2026-10-01T10-00-00-x-0.jsonl'),
+             _codex_rollout(web, prompt='Plan the launch checklist'), base + 2)
+        _put(os.path.join(codex, 'sessions', '2026', '10', '01', 'rollout-2026-10-01T10-00-01-x-1.jsonl'),
+             _codex_rollout(web, prompt='Plan the launch checklist'), base + 3)
+        _put(os.path.join(codex, 'session_index.jsonl'),
+             _jl({'id': 'x-0', 'thread_name': 'Launch plan'}, {'id': 'x-1', 'thread_name': _FAKE['aws key']}))
+        assert ls_mod.summarize_transcript(os.path.join(proj, 'c-sum.jsonl'))['first_prompt'] is None
+        inv = ls_mod.inventory(claude_roots=[os.path.join(home, '.claude', 'projects')], codex_root=codex,
+                               cursor_root=os.path.join(home, 'none'), home=home)
+        got = {r['id']: r['title'] for r in ls_mod.recent_titles(inv['recent'], codex_root=codex)}
+    # a thread name that looks like a credential falls to the next candidate
+    assert got == {'c-sum': 'Release notes cleanup', 'c-both': 'My own name', 'x-0': 'Launch plan',
+                   'x-1': 'Plan the launch checklist'}, got
+
+
+def test_welcome_names_a_session_with_a_withheld_title_by_its_project():
+    def recent(hq, home):
+        web = os.path.join(home, 'code', 'web')
+        return [{'id': 'r1', 'title': None, 'cwd': web, 'at': '2026-10-03T09:00:00Z', 'harness': 'claude_code'},
+                {'id': 'r2', 'title': _FAKE['anthropic export'], 'cwd': web, 'at': '2026-10-02T09:00:00Z',
+                 'harness': 'codex'},
+                {'id': 'r3', 'title': 'Ship the web fix', 'cwd': web, 'at': '2026-10-01T09:00:00Z',
+                 'harness': 'claude_code'}]
+    with tempfile.TemporaryDirectory() as tmp:
+        hq, home = os.path.join(tmp, 'hq'), os.path.join(tmp, 'home')
+        w, _ = _welcome(recent=recent(hq, home))
+    assert [r['title'] for r in w['recent_work']] == ['Session in web', 'Session in web', 'Ship the web fix'], \
+        w['recent_work']
+    blob = json.dumps(w)
+    assert 'ANTHROPIC' not in blob and 'sk-' not in blob
+
+
+def test_welcome_headline_for_one_session_does_not_say_most_of_them():
+    one = {'counts': {'claude_code': 0, 'codex': 1, 'cursor': 0}, 'unplaced': 1, 'notes': [],
+           'projects': {}, 'sessions': {'k1': 'codex'}, 'days': {'2026-10-01'}, 'recent': []}
+    w, _ = _welcome(inv=one, recent=[])
+    assert w['headline'] == 'HQ found 1 past session on this Mac, in Codex.', w['headline']
+
+
+def test_display_path_outside_home_is_the_folder_name():
+    saved = os.environ.get('HOME')
+    try:
+        os.environ['HOME'] = '/home/alex'
+        assert sweep._display_path('/home/alex/code/web') == '~/code/web'
+        assert sweep._display_path('/home/alex') == '~'
+        assert sweep._display_path('/Volumes/work/client-site') == 'client-site'
+        assert sweep._display_path('/home/alexandra/code/app/') == 'app'
+    finally:
+        if saved is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = saved
+
+
+def test_inventory_does_not_follow_a_project_symlink_outside_home():
+    with tempfile.TemporaryDirectory() as tmp:
+        home, outside = os.path.join(tmp, 'home'), os.path.join(tmp, 'elsewhere')
+        web = os.path.join(home, 'code', 'web')
+        os.makedirs(web)
+        projects = os.path.join(home, '.claude', 'projects')
+        _put(os.path.join(projects, '-code-web', 'c-0.jsonl'), _claude_transcript(web), _TS0)
+        _put(os.path.join(outside, 'c-out.jsonl'), _claude_transcript(outside, 'Outside'), (_TS0 + 1))
+        _put(os.path.join(home, 'real-proj', 'c-in.jsonl'), _claude_transcript(web, 'Inside'), (_TS0 + 2))
+        os.symlink(outside, os.path.join(projects, '-linked-out'))
+        os.symlink(os.path.join(home, 'real-proj'), os.path.join(projects, '-linked-in'))
+        inv = ls_mod.inventory(claude_roots=[projects], codex_root=os.path.join(home, '.codex'),
+                               cursor_root=os.path.join(home, 'none'), home=home)
+    assert sorted(inv['sessions']) == ['c-0', 'c-in'], inv['sessions']
+    assert outside not in inv['projects'], inv['projects']
 
 
 def main():

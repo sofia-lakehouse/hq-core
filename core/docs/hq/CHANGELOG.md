@@ -1,4 +1,50 @@
 ## [Unreleased]
+- Fixed: the first Daily Brief on a Mac with past work said "Nothing owed"
+  and "no sessions". The welcome edition counted only sessions started from
+  HQ. It now counts every Claude Code transcript (including a
+  `CLAUDE_CONFIG_DIR` folder), Codex rollout and Cursor workspace on the Mac,
+  and adds `headline`, `top_projects`, `top_repos`, `recent_work`, `harness`,
+  `tree`, `actions` (one `primary`) and `sessions.local`/`imported`. Other
+  companies' work is counted and never named. A failed source shows one plain
+  note; exception text goes to stderr. `brief_rank.py --check` reports
+  `welcome_problems` for empty-state lines on a first run with sessions.
+  Harness ids in the welcome fields are `claude-code`, `codex` and `cursor`;
+  the underscore keys appear only inside `harness.counts`. `recent_work`
+  titles come from Claude Code custom titles and summaries and Codex thread
+  names first. A first prompt line is used only when nothing else exists, and
+  never when it may hold a credential. The filter is safe by default: any
+  title that names a credential (password, secret, token, api key, bearer,
+  private key, access key, auth, credential, key, pass, pin, otp and similar),
+  sets a name such as DBPASS= or MYKEY=, holds a known API key prefix, a
+  private-key header or a URL with a password, or holds a hex run of 24+
+  characters, a run of 16+ mixed letters and digits, or a base64/base62 run of
+  20+ with a digit or capital letter is dropped, and that session
+  shows as "Session in <project>". Session-row titles from the registry, lane
+  and thread fields use the same filter. A folder outside the
+  home folder shows by its name only, and a project-folder symlink that points
+  outside the home folder is not followed.
+- Fixed: the image guard charged a sub-agent's image reads to the parent
+  session's budget in two cases, which blocked sub-agent visual checks once
+  the parent was full. The first case was a payload with an agent_id
+  arriving with an empty `HQ_HOOK_AGENT_ID` inherited from an outer process.
+  The second was a host that sends no agent_id but does send a sub-agent
+  transcript path (`<session>/subagents/agent-<id>.jsonl`). The payload's
+  agent_id now wins, and the transcript path keys the sub-agent's own ledger.
+  The parent's own reads are still counted and still blocked at 2 MB per
+  image, 8 MB total and 32 images (feedback_3d42bae3).
+- Added: the daily-brief skill works with or without a company, so the
+  welcome brief on a fresh install can be built before any company exists
+  (#1385).
+- Fixed: repo symlink roots are pinned to an owner list, so a symlink under
+  repos/ cannot point the scope guard at another company's tree (#1408).
+- Fixed: Codex runs HQ hooks on Windows through a Git Bash launcher instead
+  of failing to start them (#1320).
+- Fixed: the desktop update hook honors HQ_UPDATER_DISABLED and never quits,
+  replaces or relaunches a running HQ app; it only updates a closed app
+  (#1395).
+- Fixed: Codex hook commands on Windows no longer echo onto stdout, so hook
+  output stays valid JSON and an unset HQ_ROOT is not printed literally
+  (#1414).
 - Fixed: the hook gate keeps HQ Anywhere enabled when Node or its flag reader
   is missing or the lookup fails. Explicit false and the false/0 environment
   kill switch still disable it.
